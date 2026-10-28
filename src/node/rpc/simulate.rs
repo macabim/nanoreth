@@ -140,7 +140,11 @@ where
                         let txs_without_gas_limit =
                             calls.iter().filter(|tx| tx.as_ref().gas_limit().is_none()).count();
 
-                        if total_specified_gas > block_gas_limit {
+                        // Explicit limits reserve gas per transaction, not for the whole sequence.
+                        // The executor checks each limit against the remaining block gas after
+                        // earlier calls consume their actual gas. Preserve the default allocation
+                        // rule when any call omits its limit.
+                        if txs_without_gas_limit > 0 && total_specified_gas > block_gas_limit {
                             return Err(EthApiError::Other(Box::new(
                                 EthSimulateError::BlockGasLimitExceeded,
                             )));
