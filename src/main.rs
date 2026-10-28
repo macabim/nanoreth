@@ -10,6 +10,7 @@ use reth_hl::{
     addons::{
         call_forwarder::{self, CallForwarderApiServer},
         hl_node_compliance::{self, server_restart},
+        pending_feed::{PendingFeed, PendingLookup, PendingLookupApiServer},
         subscribe_fixup::SubscribeFixup,
         sync_server::{HlSyncApiServer, HlSyncServer, ProviderSyncReader, set_sync_db_reader},
         tx_forwarder::{self, EthForwarderApiServer},
@@ -63,6 +64,11 @@ fn main() -> eyre::Result<()> {
             let enable_sync_server = ext.enable_sync_server;
             let hl_node_compliant_default = ext.hl_node_compliant;
             let hl_multiplexed = ext.hl_node_compliant_multiplexed;
+            let pending_feed = ext.hl_mempool_dir.clone().map(|path| {
+                let feed = PendingFeed::new();
+                feed.clone().start(path);
+                feed
+            });
 
             // Shared state to shuttle captured methods between hooks (only used in multiplexed mode)
             let captured: Arc<std::sync::Mutex<CapturedMethods>> =
@@ -145,6 +151,7 @@ fn main() -> eyre::Result<()> {
                             Arc::new(ctx.registry.eth_handlers().pubsub.clone()),
                             Arc::new(ctx.registry.eth_api().provider().clone()),
                             Box::new(ctx.node().task_executor.clone()),
+                            pending_feed.clone(),
                         )
                         .into_rpc(),
                     )?;
@@ -158,6 +165,12 @@ fn main() -> eyre::Result<()> {
                         // Original behavior: unconditional filtering
                         hl_node_compliance::install(&mut ctx, true)?;
                         info!("hl-node compliant mode enabled");
+                    }
+                    if let Some(feed) = pending_feed.clone() {
+                        ctx.modules.replace_configured(PendingLookup {
+                            eth: ctx.registry.eth_api().clone(),
+                            feed,
+                        }.into_rpc())?;
                     }
 
                     if !ext.experimental_eth_get_proof {
