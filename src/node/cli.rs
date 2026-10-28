@@ -36,6 +36,9 @@ macro_rules! not_applicable {
 #[derive(Debug, Clone, Args)]
 #[non_exhaustive]
 pub struct HlNodeArgs {
+    /// hl-node mempool_txs directory for pending transaction notifications.
+    #[arg(long, env = "HL_MEMPOOL_DIR")]
+    pub hl_mempool_dir: Option<std::path::PathBuf>,
     #[command(flatten)]
     pub block_source_args: BlockSourceArgs,
 
