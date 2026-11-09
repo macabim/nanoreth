@@ -86,7 +86,8 @@ impl BlockSource for HlNodeBlockSource {
 
             let block = fallback.collect_block(height).await?;
             metrics.fetched_from_fallback.increment(1);
-            Self::update_last_fetch(last_local_fetch, height, now).await;
+            // Keep the grace period tied to local progress. Fallback progress must not
+            // delay each subsequent missing local block by the same grace period.
             Ok(block)
         })
     }
