@@ -212,3 +212,112 @@ fn test_hourly_files_sort() -> eyre::Result<()> {
     assert_eq!(file_names, ["9", "14"]);
     Ok(())
 }
+
+#[derive(Debug)]
+struct RecoveryFallback {
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    fail_next: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BlockSource for RecoveryFallback {
+    fn collect_block(&self, height: u64) -> BoxFuture<'static, eyre::Result<BlockAndReceipts>> {
+        use std::sync::atomic::Ordering;
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        let failed = self.fail_next.swap(false, Ordering::SeqCst);
+        Box::pin(async move {
+            if failed {
+                return Err(eyre::eyre!("test fallback failure"));
+            }
+            Ok(empty_block(height, 1722633600, b"fallback").1)
+        })
+    }
+
+    fn find_latest_block_number(&self) -> BoxFuture<'static, Option<u64>> {
+        Box::pin(async { Some(1000000) })
+    }
+
+    fn recommended_chunk_size(&self) -> u64 {
+        1
+    }
+}
+
+fn recovery_source(
+    threshold: Duration,
+) -> (HlNodeBlockSource, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicBool>) {
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fail_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let source = HlNodeBlockSource {
+        fallback: Arc::new(Box::new(RecoveryFallback {
+            requests: requests.clone(),
+            fail_next: fail_next.clone(),
+        })),
+        args: HlNodeBlockSourceArgs {
+            root: PathBuf::from("/nonexistent"),
+            fallback_threshold: threshold,
+        },
+        local_blocks_cache: Arc::new(Mutex::new(LocalBlocksCache::new(CACHE_SIZE))),
+        last_local_fetch: Arc::new(Mutex::new(None)),
+        metrics: HlNodeBlockSourceMetrics::default(),
+    };
+    (source, requests, fail_next)
+}
+
+#[tokio::test]
+async fn test_recovery_fallback_sequence_does_not_renew_local_grace() {
+    use std::sync::atomic::Ordering;
+    let (source, requests, _) = recovery_source(Duration::from_secs(5));
+    let previous = (100, OffsetDateTime::now_utc() - Duration::from_secs(6));
+    *source.last_local_fetch.lock().await = Some(previous);
+    for height in 101..=103 {
+        assert_eq!(
+            source.collect_block(height).await.unwrap(),
+            empty_block(height, 1722633600, b"fallback").1
+        );
+        assert_eq!(*source.last_local_fetch.lock().await, Some(previous));
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn test_recovery_initial_local_grace_and_local_priority() {
+    use std::sync::atomic::Ordering;
+    let (source, requests, _) = recovery_source(Duration::from_secs(5));
+    source
+        .local_blocks_cache
+        .lock()
+        .await
+        .load_scan_result(scan_result_from_single_block(empty_block(100, 1722633600, b"local").1));
+    assert_eq!(source.collect_block(100).await.unwrap(), empty_block(100, 1722633600, b"local").1);
+    assert!(source.collect_block(101).await.is_err());
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    source
+        .local_blocks_cache
+        .lock()
+        .await
+        .load_scan_result(scan_result_from_single_block(empty_block(101, 1722633600, b"local").1));
+    assert_eq!(source.collect_block(101).await.unwrap(), empty_block(101, 1722633600, b"local").1);
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_recovery_zero_threshold_and_fallback_failure_retry() {
+    use std::sync::atomic::Ordering;
+    let (source, requests, fail_next) = recovery_source(Duration::ZERO);
+    let previous = (100, OffsetDateTime::now_utc());
+    *source.last_local_fetch.lock().await = Some(previous);
+    fail_next.store(true, Ordering::SeqCst);
+    assert!(source.collect_block(101).await.is_err());
+    assert_eq!(*source.last_local_fetch.lock().await, Some(previous));
+    assert!(source.collect_block(101).await.is_ok());
+    assert!(source.collect_block(102).await.is_ok());
+    assert_eq!(*source.last_local_fetch.lock().await, Some(previous));
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn test_recovery_without_local_progress_has_no_grace() {
+    let (source, _, _) = recovery_source(Duration::from_secs(5));
+    assert!(source.collect_block(100).await.is_ok());
+    assert!(source.collect_block(101).await.is_ok());
+    assert_eq!(*source.last_local_fetch.lock().await, None);
+}
