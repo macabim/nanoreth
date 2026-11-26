@@ -6,7 +6,7 @@ use alloy_eips::Decodable2718;
 use alloy_primitives::Bytes;
 use alloy_rpc_types::{Transaction, TransactionInfo};
 use reth_primitives_traits::SignerRecoverable;
-use reth_rpc_eth_api::transaction::FromConsensusTx;
+use reth_rpc_convert::FromConsensusTx;
 use serde::Deserialize;
 
 use crate::addons::utils::EthWrapper;
