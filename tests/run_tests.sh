@@ -32,6 +32,11 @@ if [[ ! "$ETH_RPC_URL" =~ ^https?:// && ! "$ETH_RPC_URL" =~ ^wss?:// ]]; then
     fail "ETH_RPC_URL must be an http(s) or ws(s) url"
 fi
 
+# System txs are hidden only in hl-node compliant mode, which the system tx receipt test needs while
+# the eth_getLogs test needs them visible. Point HL_RPC_URL at a compliant endpoint (for a
+# multiplexed node, ETH_RPC_URL with ?hl=true); it defaults to ETH_RPC_URL.
+HL_RPC_URL="${HL_RPC_URL:-$ETH_RPC_URL}"
+
 TRACE_RPC_URL="${TRACE_RPC_URL/wss:\/\//https:\/\/}"
 TRACE_RPC_URL="${TRACE_RPC_URL/ws:\/\//http:\/\/}"
 
@@ -83,12 +88,47 @@ echo "$TRACE_RESULT" | jq -e \
     --arg success "$MISSING_SUCCESS" \
     '
     (.error | not) and
-    ([.result[]?.transactionHash] | unique) as $hashes |
-    ($hashes | length) == $expected and
-    ($hashes | index($reverted) != null) and
-    ($hashes | index($success) != null)
+    (([.result[]?.transactionHash] | unique) as $hashes |
+        ($hashes | length) == $expected and
+        ($hashes | index($reverted) != null) and
+        ($hashes | index($success) != null))
     ' > /dev/null \
     && success "$TITLE" || fail "$TITLE - trace_block missing expected tx hashes"
+
+TITLE="debug_traceTransaction should run a JavaScript tracer"
+# reth v2.8.1 builds JS tracing only with its js-tracer feature; without it this returns
+# "JS Tracer is not enabled".
+JS_TRACER='{"tracer":"{steps: 0, step: function() { this.steps++ }, fault: function() {}, result: function() { return this.steps > 0 }}"}'
+RESULT=$(curl -sS -H 'content-type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"debug_traceTransaction\",\"params\":[\"$MISSING_SUCCESS\",$JS_TRACER]}" \
+    "$TRACE_RPC_URL")
+echo "$RESULT" | jq -e '(.error | not) and (.result == true)' > /dev/null \
+    && success "$TITLE" || fail "$TITLE - returned $RESULT"
+
+TITLE="metrics endpoint should export jemalloc memory gauges"
+# Point METRICS_URL at the node's --metrics address (e.g. http://127.0.0.1:9001).
+if [[ -n "${METRICS_URL:-}" ]]; then
+    curl -sS "$METRICS_URL" | grep -qE '^(reth_)?jemalloc_allocated' \
+        && success "$TITLE" || fail "$TITLE - no jemalloc_allocated metric at $METRICS_URL"
+else
+    echo "Skipped: $TITLE - set METRICS_URL to test the metrics endpoint"
+fi
+
+TITLE="eth_sendRawTransactionSync should be forwarded upstream like eth_sendRawTransaction"
+# The forwarder registered it as eth_eth_sendRawTransactionSync, so the real method fell through
+# to the local handler and panicked. An undecodable tx is rejected upstream, so nothing is sent;
+# both methods must return that same upstream error.
+send_invalid_tx() {
+    curl -sS -H 'content-type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":[\"0x00\"]}" \
+        "$ETH_RPC_URL"
+}
+ASYNC=$(send_invalid_tx eth_sendRawTransaction || true)
+SYNC=$(send_invalid_tx eth_sendRawTransactionSync || true)
+echo "$ASYNC" | jq -e '.error.message | type == "string"' > /dev/null \
+    || fail "$TITLE - eth_sendRawTransaction returned $ASYNC"
+[[ "$(echo "$SYNC" | jq -c .error)" == "$(echo "$ASYNC" | jq -c .error)" ]] \
+    && success "$TITLE" || fail "$TITLE - eth_sendRawTransactionSync returned $SYNC"
 
 TITLE="Issue #143 - unknown/unavailable blocks must return null instead of panicking"
 UNKNOWN_HASH=0x1111111111111111111111111111111111111111111111111111111111111111
@@ -129,7 +169,7 @@ TITLE="Issue #143 - a system tx receipt must return null instead of panicking"
 # and the adjusted index used to underflow. Walk back from the head until a block with system
 # txs turns up; they are sparse on testnet, so allow the window to be widened.
 SCAN_FROM=${SYSTEM_TX_SCAN_FROM:-$(curl -sS -H 'content-type: application/json' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "$ETH_RPC_URL" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "$HL_RPC_URL" \
     | jq -r '.result' | { read -r hex; printf '%d' "$hex"; })}
 SCAN_BLOCKS=${SYSTEM_TX_SCAN_BLOCKS:-2000}
 SYSTEM_TX=""
@@ -137,13 +177,13 @@ for ((i = 0; i < SCAN_BLOCKS; i++)); do
     BLOCK=$(printf '0x%x' $((SCAN_FROM - i)))
     SYSTEM_TX=$(curl -sS -H 'content-type: application/json' \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockReceiptsWithSystemTx\",\"params\":[\"$BLOCK\"]}" \
-        "$ETH_RPC_URL" | jq -r '.result.systemTxReceipts[0].transactionHash // empty')
+        "$HL_RPC_URL" | jq -r '.result.systemTxReceipts[0].transactionHash // empty')
     [[ -n "$SYSTEM_TX" ]] && break
 done
 if [[ -n "$SYSTEM_TX" ]]; then
     RESULT=$(curl -sS -H 'content-type: application/json' \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionReceipt\",\"params\":[\"$SYSTEM_TX\"]}" \
-        "$ETH_RPC_URL")
+        "$HL_RPC_URL")
     echo "$RESULT" | jq -e '(.error | not) and (.result == null)' > /dev/null \
         && success "$TITLE ($SYSTEM_TX)" || fail "$TITLE - $SYSTEM_TX returned $RESULT"
 else

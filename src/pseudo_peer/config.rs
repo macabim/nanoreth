@@ -3,12 +3,19 @@ use crate::chainspec::HlChainSpec;
 use super::{
     block_store::{BlockStore, DbBlockNumberFn},
     sources::{
-        BlockSourceBoxed, HlNodeBlockSource, HlNodeBlockSourceArgs,
-        LocalBlockSource, RpcBlockSource, S3BlockSource,
+        BlockSourceBoxed, HlNodeBlockSource, HlNodeBlockSourceArgs, LocalBlockSource,
+        RpcBlockSource, S3BlockSource,
     },
 };
-use aws_config::BehaviorVersion;
+use aws_config::{BehaviorVersion, timeout::TimeoutConfig};
 use std::{env::home_dir, path::PathBuf, sync::Arc, time::Duration};
+use tracing::info;
+
+/// Bounds each S3 request attempt up to the response headers. The SDK sets no read or
+/// operation timeout by default, so a request whose response never arrives waits forever
+/// and stalls the sequential block poller. A timed-out attempt is a transient error the
+/// SDK retries. Response bodies are bounded by the SDK's stalled-stream protection.
+const S3_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct BlockSourceConfig {
@@ -18,23 +25,23 @@ pub struct BlockSourceConfig {
 
 #[derive(Debug, Clone)]
 pub enum BlockSourceType {
-    S3Default { polling_interval: Duration },
-    S3 { bucket: String, polling_interval: Duration },
+    S3Default { polling_interval: Duration, concurrency: usize },
+    S3 { bucket: String, polling_interval: Duration, concurrency: usize },
     Local { path: PathBuf },
     Rpc { url: String, polling_interval: Duration },
 }
 
 impl BlockSourceConfig {
-    pub async fn s3_default(polling_interval: Duration) -> Self {
+    pub async fn s3_default(polling_interval: Duration, concurrency: usize) -> Self {
         Self {
-            source_type: BlockSourceType::S3Default { polling_interval },
+            source_type: BlockSourceType::S3Default { polling_interval, concurrency },
             block_source_from_node: None,
         }
     }
 
-    pub async fn s3(bucket: String, polling_interval: Duration) -> Self {
+    pub async fn s3(bucket: String, polling_interval: Duration, concurrency: usize) -> Self {
         Self {
-            source_type: BlockSourceType::S3 { bucket, polling_interval },
+            source_type: BlockSourceType::S3 { bucket, polling_interval, concurrency },
             block_source_from_node: None,
         }
     }
@@ -73,11 +80,12 @@ impl BlockSourceConfig {
 
     pub async fn create_block_source(&self, chain_spec: HlChainSpec) -> BlockSourceBoxed {
         match &self.source_type {
-            BlockSourceType::S3Default { polling_interval } => {
-                s3_block_source(chain_spec.official_s3_bucket(), *polling_interval).await
+            BlockSourceType::S3Default { polling_interval, concurrency } => {
+                s3_block_source(chain_spec.official_s3_bucket(), *polling_interval, *concurrency)
+                    .await
             }
-            BlockSourceType::S3 { bucket, polling_interval } => {
-                s3_block_source(bucket, *polling_interval).await
+            BlockSourceType::S3 { bucket, polling_interval, concurrency } => {
+                s3_block_source(bucket, *polling_interval, *concurrency).await
             }
             BlockSourceType::Local { path } => {
                 Arc::new(Box::new(LocalBlockSource::new(path.clone())))
@@ -121,9 +129,33 @@ impl BlockSourceConfig {
     }
 }
 
-async fn s3_block_source(bucket: impl AsRef<str>, polling_interval: Duration) -> BlockSourceBoxed {
-    let client = aws_sdk_s3::Client::new(
-        &aws_config::defaults(BehaviorVersion::latest()).region("ap-northeast-1").load().await,
-    );
-    Arc::new(Box::new(S3BlockSource::new(client, bucket.as_ref().to_string(), polling_interval)))
+async fn s3_block_source(
+    bucket: impl AsRef<str>,
+    polling_interval: Duration,
+    concurrency: usize,
+) -> BlockSourceBoxed {
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region("ap-northeast-1")
+        .timeout_config(
+            TimeoutConfig::builder().operation_attempt_timeout(S3_ATTEMPT_TIMEOUT).build(),
+        )
+        .load()
+        .await;
+    let mut s3_config = aws_sdk_s3::config::Builder::from(&config);
+
+    // Optional read-through cache (see the `s3-proxy` tool). Block objects are immutable, so a
+    // local mirror serves repeated syncs without re-paying S3 latency or requester-pays egress.
+    // Path-style addressing is required: the proxy is reached by address, not by bucket hostname.
+    if let Ok(endpoint) = std::env::var("HL_S3_ENDPOINT_URL") {
+        info!("Using S3 endpoint override: {endpoint}");
+        s3_config = s3_config.endpoint_url(endpoint).force_path_style(true);
+    }
+
+    let client = aws_sdk_s3::Client::from_conf(s3_config.build());
+    Arc::new(Box::new(S3BlockSource::new(
+        client,
+        bucket.as_ref().to_string(),
+        polling_interval,
+        concurrency,
+    )))
 }

@@ -1,5 +1,5 @@
 use alloy_consensus::BlobTransactionSidecar;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use reth_primitives_traits::{BlockBody as BlockBodyTrait, InMemorySize};
 use serde::{Deserialize, Serialize};
 
@@ -32,17 +32,23 @@ pub struct HlBlockBody {
     pub sidecars: Option<Vec<BlobTransactionSidecar>>,
     pub read_precompile_calls: Option<ReadPrecompileCalls>,
     pub highest_precompile_address: Option<Address>,
+    /// Commitment to the system tx receipts of the block source, see
+    /// [`crate::node::types::system_tx_receipts_hash`]. System tx receipts are not committed to by
+    /// the header, so execution checks its own against this.
+    pub system_tx_receipts_hash: Option<B256>,
 }
 
 pub type BlockBody = alloy_consensus::BlockBody<TransactionSigned, HlHeader>;
 
 impl InMemorySize for HlBlockBody {
     fn size(&self) -> usize {
-        self.inner.size() +
-            self.sidecars
+        self.inner.size()
+            + self
+                .sidecars
                 .as_ref()
-                .map_or(0, |s| s.capacity() * core::mem::size_of::<BlobTransactionSidecar>()) +
-            self.read_precompile_calls
+                .map_or(0, |s| s.capacity() * core::mem::size_of::<BlobTransactionSidecar>())
+            + self
+                .read_precompile_calls
                 .as_ref()
                 .map_or(0, |s| s.0.capacity() * core::mem::size_of::<ReadPrecompileCall>())
     }

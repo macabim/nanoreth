@@ -1,4 +1,8 @@
-use super::{ScopedReadPrecompileForwarder, executor::HlBlockExecutor, factory::HlEvmFactory};
+use super::{
+    ScopedReadPrecompileForwarder,
+    executor::{HlBlockExecutor, HlTxResult},
+    factory::{HlEvmFactory, RpcPrecompileSource},
+};
 use crate::{
     HlBlock, HlBlockBody, HlHeader, HlPrimitives,
     chainspec::HlChainSpec,
@@ -12,23 +16,24 @@ use crate::{
     },
 };
 use alloy_consensus::{BlockHeader, EMPTY_OMMER_ROOT_HASH, Header, Transaction as _, TxReceipt};
-use alloy_eips::{Encodable2718, merge::BEACON_NONCE};
+use alloy_eips::{Encodable2718, eip4895::Withdrawals, merge::BEACON_NONCE};
 use alloy_primitives::{Log, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
+use reth_ethereum_primitives::Receipt;
 use reth_evm::{
     ConfigureEngineEvm, ConfigureEvm, EvmEnv, EvmEnvFor, EvmFactory, ExecutableTxIterator,
     ExecutionCtxFor, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, NextBlockEnvAttributes,
-    block::{BlockExecutionError, BlockExecutorFactory, BlockExecutorFor},
+    block::{BlockExecutionError, BlockExecutorFactory, StateDB},
     eth::{EthBlockExecutionCtx, receipt_builder::ReceiptBuilder},
     execute::{BlockAssembler, BlockAssemblerInput},
     precompiles::PrecompilesMap,
 };
 use reth_evm_ethereum::EthBlockAssembler;
 use reth_payload_primitives::NewPayloadError;
-use reth_primitives::{BlockTy, HeaderTy, Receipt, SealedBlock, SealedHeader, logs_bloom};
+use reth_primitives_traits::{BlockTy, HeaderTy, SealedBlock, SealedHeader, logs_bloom};
 use reth_primitives_traits::{SignerRecoverable, WithEncoded, proofs};
 use reth_provider::BlockExecutionResult;
-use reth_revm::State;
+use revm::context::Block as _;
 use revm::{
     Inspector,
     context::{BlockEnv, CfgEnv, TxEnv},
@@ -63,12 +68,13 @@ where
             execution_ctx: ctx,
             parent,
             transactions,
-            output: BlockExecutionResult { receipts, requests, gas_used },
+            output: BlockExecutionResult { receipts, requests, gas_used, blob_gas_used: _ },
             state_root,
+            block_access_list_hash,
             ..
         } = input;
 
-        let timestamp = evm_env.block_env.timestamp.saturating_to();
+        let timestamp = evm_env.block_env.timestamp().saturating_to();
 
         // Filter out system tx receipts
         let transactions_for_root: Vec<_> =
@@ -85,8 +91,7 @@ where
             .is_shanghai_active_at_timestamp(timestamp)
             .then(|| ctx.ctx.withdrawals.map(|w| w.into_owned()).unwrap_or_default());
 
-        let withdrawals_root =
-            withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
+        let withdrawals_root = withdrawals.as_deref().map(proofs::calculate_withdrawals_root);
         let requests_hash = inner
             .chain_spec
             .is_prague_active_at_timestamp(timestamp)
@@ -116,25 +121,27 @@ where
         let header = Header {
             parent_hash: ctx.ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: evm_env.block_env.beneficiary,
+            beneficiary: evm_env.block_env.beneficiary(),
             state_root,
             transactions_root,
             receipts_root,
             withdrawals_root,
             logs_bloom,
             timestamp,
-            mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
+            mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
             nonce: BEACON_NONCE.into(),
-            base_fee_per_gas: Some(evm_env.block_env.basefee),
-            number: evm_env.block_env.number.saturating_to(),
-            gas_limit: evm_env.block_env.gas_limit,
-            difficulty: evm_env.block_env.difficulty,
+            base_fee_per_gas: Some(evm_env.block_env.basefee()),
+            number: evm_env.block_env.number().saturating_to(),
+            gas_limit: evm_env.block_env.gas_limit(),
+            difficulty: evm_env.block_env.difficulty(),
             gas_used: *gas_used,
-            extra_data: inner.extra_data.clone(),
+            extra_data: ctx.ctx.extra_data.clone(),
             parent_beacon_block_root: ctx.ctx.parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
+            block_access_list_hash,
+            slot_number: ctx.ctx.slot_number,
         };
         let system_tx_count =
             transactions.iter().filter(|t| is_system_transaction(t)).count() as u64;
@@ -143,10 +150,15 @@ where
         Ok(Self::Block {
             header,
             body: HlBlockBody {
-                inner: BlockBody { transactions, ommers: Default::default(), withdrawals },
+                inner: BlockBody {
+                    transactions,
+                    ommers: Default::default(),
+                    withdrawals: withdrawals.map(Withdrawals::new),
+                },
                 sidecars: None,
                 read_precompile_calls: ctx.extras.read_precompile_calls.clone(),
                 highest_precompile_address: ctx.extras.highest_precompile_address,
+                system_tx_receipts_hash: None,
             },
         })
     }
@@ -197,10 +209,19 @@ impl HlEvmConfig {
     pub const fn chain_spec(&self) -> &Arc<HlChainSpec> {
         self.executor_factory.spec()
     }
+
+    /// A copy of this configuration whose EVMs come with read precompiles from `source`; for the
+    /// RPC layer. See [`RpcPrecompileSource`].
+    pub fn with_rpc_precompiles(&self, source: Arc<dyn RpcPrecompileSource>) -> Self {
+        Self::new_with_evm_factory(
+            self.chain_spec().clone(),
+            HlEvmFactory::with_rpc_precompiles(source),
+        )
+    }
 }
 
 /// Ethereum block executor factory.
-#[derive(Debug, Clone, Default, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct HlBlockExecutorFactory<
     R = RethReceiptBuilder,
     Spec = Arc<HlChainSpec>,
@@ -242,6 +263,8 @@ pub struct HlBlockExecutionCtx<'a> {
     /// Executing a real block must leave it `None`: there the recorded calls are consensus data,
     /// and an input missing from them means the block itself is wrong.
     read_precompile_forwarder: Option<ScopedReadPrecompileForwarder>,
+    /// System txs at the start of the block, the ones `extras.system_tx_receipts_hash` commits to.
+    pub(super) system_tx_count: usize,
 }
 
 impl HlBlockExecutionCtx<'_> {
@@ -273,6 +296,9 @@ where
     type ExecutionCtx<'a> = HlBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = R::Receipt;
+    type TxExecutionResult = HlTxResult<<EvmF as EvmFactory>::HaltReason>;
+    type Executor<'a, DB: StateDB, I: Inspector<EvmF::Context<DB>>> =
+        HlBlockExecutor<'a, EvmF::Evm<DB, I>, Spec, &'a R>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory
@@ -280,12 +306,12 @@ where
 
     fn create_executor<'a, DB, I>(
         &'a self,
-        evm: <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>,
+        evm: EvmF::Evm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: alloy_evm::Database + 'a,
-        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<&'a mut State<DB>>> + 'a,
+        DB: StateDB,
+        I: Inspector<EvmF::Context<DB>>,
     {
         HlBlockExecutor::new(evm, ctx, self.spec().clone(), self.receipt_builder())
     }
@@ -320,8 +346,9 @@ where
         );
 
         // configure evm env based on parent block
-        let mut cfg_env =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
+        let mut cfg_env = CfgEnv::new()
+            .with_chain_id(self.chain_spec().chain().id())
+            .with_spec_and_mainnet_gas_params(spec);
         if let Some(blob_params) = &blob_params {
             cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
         }
@@ -349,6 +376,7 @@ where
             gas_limit: header.gas_limit(),
             basefee: header.base_fee_per_gas().unwrap_or_default(),
             blob_excess_gas_and_price,
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -367,8 +395,9 @@ where
         );
 
         // configure evm env based on parent block
-        let cfg_env =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec_id);
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(self.chain_spec().chain().id())
+            .with_spec_and_mainnet_gas_params(spec_id);
 
         // if the parent block did not have excess blob gas (i.e. it was pre-cancun), but it is
         // cancun now, we need to set the excess blob gas to the default value(0)
@@ -392,6 +421,7 @@ where
             basefee: basefee.unwrap_or_default(),
             // calculate excess gas based on parent block's blob gas usage
             blob_excess_gas_and_price,
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -407,13 +437,18 @@ where
                 parent_hash: block.header().parent_hash,
                 parent_beacon_block_root: block.header().parent_beacon_block_root,
                 ommers: &EMPTY_OMMERS,
-                withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals: block.body().withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
+                extra_data: block.header().extra_data.clone(),
+                slot_number: block.header().slot_number(),
+                tx_count_hint: Some(block.body().transactions.len()),
             },
             extras: HlExtras {
                 read_precompile_calls: block_body.read_precompile_calls.clone(),
                 highest_precompile_address: block_body.highest_precompile_address,
+                system_tx_receipts_hash: block_body.system_tx_receipts_hash,
             },
             read_precompile_forwarder: None,
+            system_tx_count: block.header().extras.system_tx_count as usize,
         })
     }
 
@@ -427,47 +462,66 @@ where
                 parent_hash: parent.hash(),
                 parent_beacon_block_root: attributes.parent_beacon_block_root,
                 ommers: &[],
-                withdrawals: attributes.withdrawals.map(Cow::Owned),
+                withdrawals: attributes.withdrawals.map(|w| Cow::Owned(w.into_inner())),
+                // The block assembler takes extraData from here, so keep the configured value.
+                extra_data: attributes.extra_data,
+                slot_number: None,
+                tx_count_hint: None,
             },
             // A block that has not been mined has no recorded calls of its own. The RPC
             // simulation path overwrites this with the head's precompile address range and a
             // forwarder; see `HlEthApi::simulate_v1`.
             extras: HlExtras::default(),
             read_precompile_forwarder: None,
+            system_tx_count: 0,
         })
     }
 }
 
 impl ConfigureEngineEvm<HlExecutionData> for HlEvmConfig {
-    fn evm_env_for_payload(&self, payload: &HlExecutionData) -> EvmEnvFor<Self> {
-        self.evm_env(&payload.0.header).unwrap()
+    fn evm_env_for_payload(
+        &self,
+        payload: &HlExecutionData,
+    ) -> Result<EvmEnvFor<Self>, Self::Error> {
+        self.evm_env(&payload.0.header)
     }
 
-    fn context_for_payload<'a>(&self, payload: &'a HlExecutionData) -> ExecutionCtxFor<'a, Self> {
+    fn context_for_payload<'a>(
+        &self,
+        payload: &'a HlExecutionData,
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
         let block = &payload.0;
-        HlBlockExecutionCtx {
+        Ok(HlBlockExecutionCtx {
             ctx: EthBlockExecutionCtx {
                 parent_hash: block.header.parent_hash,
                 parent_beacon_block_root: block.header.parent_beacon_block_root,
                 ommers: &EMPTY_OMMERS,
-                withdrawals: block.body.withdrawals.as_ref().map(Cow::Borrowed),
+                withdrawals: block.body.withdrawals.as_ref().map(|w| Cow::Borrowed(w.as_slice())),
+                extra_data: block.header.extra_data.clone(),
+                slot_number: block.header.slot_number(),
+                tx_count_hint: Some(block.body.transactions.len()),
             },
             extras: HlExtras {
                 read_precompile_calls: block.body.read_precompile_calls.clone(),
                 highest_precompile_address: block.body.highest_precompile_address,
+                system_tx_receipts_hash: block.body.system_tx_receipts_hash,
             },
             read_precompile_forwarder: None,
-        }
+            system_tx_count: block.header.extras.system_tx_count as usize,
+        })
     }
 
     fn tx_iterator_for_payload(
         &self,
         payload: &HlExecutionData,
-    ) -> impl ExecutableTxIterator<Self> {
-        payload.0.body.transactions.clone().into_iter().map(move |tx| {
+    ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
+        let txs = payload.0.body.transactions.clone();
+        let convert = |tx: TransactionSigned| {
             let recovered = tx.try_into_recovered().map_err(NewPayloadError::other)?;
             Ok::<_, NewPayloadError>(WithEncoded::new(recovered.encoded_2718().into(), recovered))
-        })
+        };
+
+        Ok((txs, convert))
     }
 }
 
@@ -540,7 +594,7 @@ mod tests {
         let result = evm.transact(HlTxEnv::new(tx)).unwrap().result;
         assert!(result.is_success(), "outer call must succeed: {result:?}");
         let flag = result.output().unwrap();
-        (flag[31] == 1, result.gas_used())
+        (flag[31] == 1, result.tx_gas_used())
     }
 
     #[test]
